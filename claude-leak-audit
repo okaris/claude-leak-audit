@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
-trap '' PIPE  # Ignore SIGPIPE (xargs + wc pipelines can trigger it harmlessly)
+trap '' PIPE
 
 # claude-leak-audit — Reconstruct directory trees from Claude Code chat histories
 # Shows how much of your filesystem structure is recoverable from agent metadata
 #
 # Requires: jt (jsont) — install: curl -fsSL i.jsont.sh | sh
 #
-# Usage: claude-leak-audit [--level N] [--claude-dir PATH] [--target-dir PATH]
+# Usage: claude-leak-audit [options]
 #
 # Options:
+#   -v, --verbose    Show full breakdown (progress, project roots, per-pattern counts)
 #   --level N        Max directory depth to compare (default: 3)
 #   --claude-dir     Path to .claude directory (default: auto-detect)
-#   --target-dir     Real directory root to compare against (default: inferred from cwd in histories)
+#   --target-dir     Real directory root to compare against (default: auto-detect)
+#   --no-secrets     Skip secrets/PII scan
 #   --show-tree      Print the reconstructed tree
-#   --show-missed    Print paths that exist on disk but were NOT found in histories
-#   --show-extra     Print paths found in histories that don't exist on disk (deleted/moved)
-#   --no-secrets     Skip secrets/PII scan (on by default)
+#   --show-missed    Print paths on disk but NOT in histories
+#   --show-extra     Print paths in histories but NOT on disk (ghosts)
 
 LEVEL=3
 CLAUDE_DIR=""
@@ -25,9 +26,11 @@ SHOW_TREE=false
 SHOW_MISSED=false
 SHOW_EXTRA=false
 SCAN_SECRETS=true
+VERBOSE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        -v|--verbose) VERBOSE=true; shift ;;
         --level) LEVEL="$2"; shift 2 ;;
         --claude-dir) CLAUDE_DIR="$2"; shift 2 ;;
         --target-dir) TARGET_DIR="$2"; shift 2 ;;
@@ -37,28 +40,26 @@ while [[ $# -gt 0 ]]; do
         --scan-secrets) SCAN_SECRETS=true; shift ;;
         --no-secrets) SCAN_SECRETS=false; shift ;;
         -h|--help)
-            sed -n '3,19p' "$0"
+            sed -n '3,20p' "$0"
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
-# Check for jt
 if ! command -v jt &>/dev/null; then
     echo "Error: jt (jsont) not found. Install: curl -fsSL i.jsont.sh | sh" >&2
     exit 1
 fi
 
-# --- Phase 1: Find .claude directories and JSONL files ---
+log() { $VERBOSE && echo "$@" || true; }
 
-echo "=== Claude Leak Audit ==="
-echo ""
+# --- Phase 1: Find .claude directories and JSONL files ---
 
 if [[ -n "$CLAUDE_DIR" ]]; then
     SEARCH_DIRS=("$CLAUDE_DIR")
 else
-    echo "[*] Scanning for .claude directories..."
+    log "[*] Scanning for .claude directories..."
     SEARCH_DIRS=()
     for candidate in \
         "$HOME/.claude" \
@@ -69,7 +70,6 @@ else
     done
 fi
 
-# Collect all JSONL files
 JSONL_LIST=$(mktemp)
 for dir in "${SEARCH_DIRS[@]}"; do
     find "$dir" -name '*.jsonl' -size +0c 2>/dev/null
@@ -82,14 +82,15 @@ if [[ $NUM_FILES -eq 0 ]]; then
     exit 1
 fi
 
-echo "[*] Found $NUM_FILES chat history files"
-
 TOTAL_LINES=$(cat $(cat "$JSONL_LIST") 2>/dev/null | wc -l)
-echo "[*] Total messages: $TOTAL_LINES"
+
+echo ""
+echo "  claude-leak-audit"
+echo "  ═══════════════════════════════════════"
+echo "  scanned $NUM_FILES sessions, $TOTAL_LINES messages"
+echo ""
 
 # --- Phase 2: Path extraction via jt (10 parallel structured queries) ---
-# Each query targets a specific data source in the JSONL schema.
-# All run in parallel — total time ≈ one sequential read of the data.
 
 EXTRACTED=$(mktemp)
 NCPU=$(nproc 2>/dev/null || echo 4)
@@ -97,33 +98,22 @@ trap 'rm -f "$EXTRACTED" "${EXTRACTED}.real" "${EXTRACTED}.deduped" "${EXTRACTED
 
 FILES=$(cat "$JSONL_LIST")
 
-echo "[*] Extracting paths (10 parallel jt queries)..."
+log "[*] Extracting paths (10 parallel jt queries)..."
 
 {
-  # Tool call inputs — exact file paths from Read/Edit/Write
   jt $FILES 'where .message.content[0].name in ("Read", "Edit", "Write") select .message.content[0].input.file_path as p' --raw 2>/dev/null &
-  # Tool call inputs — search/glob paths
   jt $FILES 'where .message.content[0].name in ("Glob", "Grep") select .message.content[0].input.path as p' --raw 2>/dev/null &
-  # Bash commands — paths extracted via regex
   jt $FILES 'where .message.content[0].name == "Bash" select .message.content[0].input.command as cmd' --raw 2>/dev/null &
-  # Tool results — file contents, ls output, grep matches sent back to API
   jt $FILES 'where .message.content[0].type == "tool_result" select to_string(.message.content[0].content) as text' --raw 2>/dev/null &
-  # User messages (string content — typed paths, pasted content)
   jt $FILES 'where .message.content is string select .message.content' --raw 2>/dev/null &
-  # Working directory on every message
   jt $FILES 'select .cwd' --raw 2>/dev/null &
-  # Compaction summaries — contain full session history with all file references
   jt $FILES 'where .isCompactSummary == true select to_string(.message.content) as text' --raw 2>/dev/null &
-  # Tool results (denormalized copy at top level)
   jt $FILES 'where .toolUseResult exists select to_string(.toolUseResult.content) as text' --raw 2>/dev/null &
-  # Subagent tool results
   jt $FILES 'where .data.message.toolUseResult exists select to_string(.data.message.toolUseResult) as text' --raw 2>/dev/null &
-  # Subagent message content (tool calls + results from nested agents)
   jt $FILES 'where .data.message.message.content exists select to_string(.data.message.message.content) as text' --raw 2>/dev/null &
   wait
 } | grep -oE '(/[a-zA-Z0-9_.~@+-]+){2,}' | sort -u > "$EXTRACTED"
 
-# Filter out system/noise paths
 grep -v -E '^/(usr|bin|sbin|lib|lib64|etc|proc|sys|dev|tmp|var/(run|lib|cache|log)|snap|nix|opt|run)' "$EXTRACTED" | \
     grep -v -E '\.(so|dylib|o|pyc|whl|egg)$' | \
     grep -v -E '^/[a-z]+$' | \
@@ -131,14 +121,13 @@ grep -v -E '^/(usr|bin|sbin|lib|lib64|etc|proc|sys|dev|tmp|var/(run|lib|cache|lo
     sort -u > "${EXTRACTED}.deduped"
 
 NUM_PATHS=$(wc -l < "${EXTRACTED}.deduped")
-echo "[*] Unique paths extracted: $NUM_PATHS"
+log "[*] Unique paths extracted: $NUM_PATHS"
 
-# --- Phase 3: Secrets scan (optional) ---
+# --- Phase 3: Secrets scan ---
 
 if $SCAN_SECRETS; then
-    echo "[*] Scanning for secrets and PII..."
+    log "[*] Scanning for secrets and PII..."
 
-    # All secret scans in parallel — each writes count to a temp file
     STMP=$(mktemp -d)
     pcount() { cat "$JSONL_LIST" | xargs -P "$NCPU" -n 50 grep -ohE "$1" 2>/dev/null | wc -l | tr -d ' \n' > "$STMP/$2"; }
 
@@ -157,49 +146,56 @@ if $SCAN_SECRETS; then
         grep -v -E '^(127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|255\.|224\.)' | sort -u | wc -l | tr -d ' \n' > "$STMP/ips") &
     wait
 
-    SK_LIVE=$(cat "$STMP/sk_live")
-    SK_ANT=$(cat "$STMP/sk_ant")
-    BEARER=$(cat "$STMP/bearer")
-    GHTOKEN=$(cat "$STMP/ghtoken")
+    SK_LIVE=$(cat "$STMP/sk_live"); SK_ANT=$(cat "$STMP/sk_ant")
+    BEARER=$(cat "$STMP/bearer"); GHTOKEN=$(cat "$STMP/ghtoken")
     AWS_KEY=$(cat "$STMP/aws_key")
-    GENERIC_KEY=$(cat "$STMP/generic_key")
-    GENERIC_TOKEN=$(cat "$STMP/generic_token")
+    GENERIC_KEY=$(cat "$STMP/generic_key"); GENERIC_TOKEN=$(cat "$STMP/generic_token")
     GENERIC_SECRET=$(cat "$STMP/generic_secret")
-    REAL_EMAILS=$(cat "$STMP/emails")
-    REAL_IPS=$(cat "$STMP/ips")
+    REAL_EMAILS=$(cat "$STMP/emails"); REAL_IPS=$(cat "$STMP/ips")
     DOTENV=$(cat "$STMP/dotenv")
     rm -rf "$STMP"
 
-    echo ""
-    echo "  Secrets & PII"
-    echo "  ─────────────────────────────────────"
-    printf "  %-22s %6s\n" "sk-* API keys" "$SK_LIVE"
-    printf "  %-22s %6s\n" "sk-ant-* keys" "$SK_ANT"
-    printf "  %-22s %6s\n" "Bearer tokens" "$BEARER"
-    printf "  %-22s %6s\n" "GitHub tokens" "$GHTOKEN"
-    printf "  %-22s %6s\n" "AWS access keys" "$AWS_KEY"
-    printf "  %-22s %6s\n" "KEY=value" "$GENERIC_KEY"
-    printf "  %-22s %6s\n" "TOKEN=value" "$GENERIC_TOKEN"
-    printf "  %-22s %6s\n" "SECRET=value" "$GENERIC_SECRET"
-    echo ""
-    printf "  %-22s %6s unique\n" "Email addresses" "$REAL_EMAILS"
-    printf "  %-22s %6s unique\n" "Public IPs" "$REAL_IPS"
-    printf "  %-22s %6s refs\n" ".env files" "$DOTENV"
+    # Sum all secret occurrences for headline
+    TOTAL_SECRETS=$((SK_LIVE + SK_ANT + BEARER + GHTOKEN + AWS_KEY + GENERIC_KEY + GENERIC_TOKEN + GENERIC_SECRET))
+
+    echo "  secrets found:    $TOTAL_SECRETS"
+    echo "  emails leaked:    $REAL_EMAILS unique addresses"
+    echo "  public IPs:       $REAL_IPS unique"
+    echo "  .env references:  $DOTENV"
+
+    if $VERBOSE; then
+        echo ""
+        echo "  Secret Breakdown"
+        echo "  ─────────────────────────────────────"
+        printf "  %-22s %6s\n" "sk-* API keys" "$SK_LIVE"
+        printf "  %-22s %6s\n" "sk-ant-* keys" "$SK_ANT"
+        printf "  %-22s %6s\n" "Bearer tokens" "$BEARER"
+        printf "  %-22s %6s\n" "GitHub tokens" "$GHTOKEN"
+        printf "  %-22s %6s\n" "AWS access keys" "$AWS_KEY"
+        printf "  %-22s %6s\n" "KEY=value" "$GENERIC_KEY"
+        printf "  %-22s %6s\n" "TOKEN=value" "$GENERIC_TOKEN"
+        printf "  %-22s %6s\n" "SECRET=value" "$GENERIC_SECRET"
+    fi
+
     echo ""
 fi
 
 # --- Phase 4: Infer target directory ---
 
 if [[ -z "$TARGET_DIR" ]]; then
-    echo ""
-    echo "[*] Top project roots found in histories:"
     ALL_ROOTS_FILE=$(mktemp)
     grep -oE '^/home/[^/]+/[^/]+' "${EXTRACTED}.deduped" | sort | uniq -c | sort -rn > "$ALL_ROOTS_FILE"
-    head -10 "$ALL_ROOTS_FILE" | while IFS= read -r line; do
-        count=$(echo "$line" | awk '{print $1}')
-        dir=$(echo "$line" | awk '{print $2}')
-        [[ -n "$dir" ]] && printf "      %5s paths  %s\n" "$count" "$dir"
-    done
+
+    if $VERBOSE; then
+        echo "  Project Roots"
+        echo "  ─────────────────────────────────────"
+        head -10 "$ALL_ROOTS_FILE" | while IFS= read -r line; do
+            count=$(echo "$line" | awk '{print $1}')
+            dir=$(echo "$line" | awk '{print $2}')
+            [[ -n "$dir" ]] && printf "  %5s paths  %s\n" "$count" "$dir"
+        done
+        echo ""
+    fi
 
     TARGET_DIR=$(head -1 "$ALL_ROOTS_FILE" | awk '{print $2}')
     rm -f "$ALL_ROOTS_FILE"
@@ -207,10 +203,6 @@ if [[ -z "$TARGET_DIR" ]]; then
         TARGET_DIR="$HOME"
     fi
 fi
-
-echo ""
-echo "[*] Target directory: $TARGET_DIR"
-echo "[*] Comparison depth: $LEVEL levels"
 
 # --- Phase 5: Build reconstructed tree ---
 
@@ -247,7 +239,7 @@ NUM_RECONSTRUCTED=$(wc -l < "${EXTRACTED}.reconstructed")
 
 # --- Phase 6: Build real tree ---
 
-echo "[*] Building real directory tree (depth $LEVEL)..."
+log "[*] Building real directory tree (depth $LEVEL)..."
 find "$TARGET_DIR" -maxdepth "$LEVEL" \( -name '.git' -o -name 'node_modules' -o -name '__pycache__' -o -name '.venv' -o -name 'venv' \) -prune -o -print 2>/dev/null | \
     sed "s|^${TARGET_DIR}/||" | \
     grep -v "^${TARGET_DIR}\$" | \
@@ -276,38 +268,39 @@ fi
 
 # --- Output ---
 
-echo ""
-echo "  Results"
+echo "  Directory Tree ($TARGET_DIR, depth $LEVEL)"
 echo "  ─────────────────────────────────────"
-echo "  target:       $TARGET_DIR"
-echo "  depth:        $LEVEL levels"
-echo "  sessions:     $NUM_FILES"
-echo "  messages:     $TOTAL_LINES"
+echo "  ${MATCH_PCT}% of your filesystem recovered from chat history"
 echo ""
-echo "  real paths:   $NUM_REAL"
-echo "  extracted:    $NUM_RECONSTRUCTED"
-echo "  matches:      $MATCHES"
-echo ""
-echo "  RECALL:       ${MATCH_PCT}%  ($MATCHES of $NUM_REAL real paths recovered)"
-echo "  PRECISION:    ${PRECISION}%  ($MATCHES of $NUM_RECONSTRUCTED extracted paths valid)"
-echo "  missed:       $MISSED paths not in histories"
-echo "  stale:        $EXTRA paths no longer on disk"
+echo "  $MATCHES of $NUM_REAL real paths reconstructed"
+echo "  $EXTRA ghost paths (deleted files still in history)"
+echo "  $MISSED paths never seen by the agent"
+
+if $VERBOSE; then
+    echo ""
+    echo "  extracted:    $NUM_RECONSTRUCTED"
+    echo "  precision:    ${PRECISION}%"
+fi
+
 echo ""
 
 if $SHOW_TREE; then
+    echo "  Reconstructed Tree"
+    echo "  ─────────────────────────────────────"
+    awk -F/ '{ indent = "  "; for (i = 1; i < NF; i++) indent = indent "  "; print indent $NF }' "${EXTRACTED}.reconstructed" | head -200
     echo ""
-    echo "=== Reconstructed Tree ==="
-    awk -F/ '{ indent = ""; for (i = 1; i < NF; i++) indent = indent "  "; print indent $NF }' "${EXTRACTED}.reconstructed" | head -200
 fi
 
 if $SHOW_MISSED; then
+    echo "  Missed Paths (on disk, not in histories)"
+    echo "  ─────────────────────────────────────"
+    comm -23 "${EXTRACTED}.real" "${EXTRACTED}.reconstructed" | sed 's/^/  /' | head -100
     echo ""
-    echo "=== Missed Paths (on disk but NOT in histories) ==="
-    comm -23 "${EXTRACTED}.real" "${EXTRACTED}.reconstructed" | head -100
 fi
 
 if $SHOW_EXTRA; then
+    echo "  Ghost Paths (in histories, not on disk)"
+    echo "  ─────────────────────────────────────"
+    comm -13 "${EXTRACTED}.real" "${EXTRACTED}.reconstructed" | sed 's/^/  /' | head -100
     echo ""
-    echo "=== Stale/Extra Paths (in histories but NOT on disk) ==="
-    comm -13 "${EXTRACTED}.real" "${EXTRACTED}.reconstructed" | head -100
 fi

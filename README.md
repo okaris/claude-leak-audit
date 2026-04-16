@@ -5,44 +5,22 @@ See how much of your filesystem an AI agent can reconstruct from your Claude Cod
 ```
 $ claude-leak-audit
 
-=== Claude Leak Audit ===
+  claude-leak-audit
+  ═══════════════════════════════════════
+  scanned 1089 sessions, 232873 messages
 
-[*] Found 1083 chat history files
-[*] Total messages: 232122
-[*] Extracting paths (10 parallel jt queries)...
-[*] Unique paths extracted: 36038
-[*] Scanning for secrets and PII...
+  secrets found:    118
+  emails leaked:    54 unique addresses
+  public IPs:       112 unique
+  .env references:  8064
 
-  Secrets & PII
+  Directory Tree (/home/ok/inference, depth 3)
   ─────────────────────────────────────
-  sk-* API keys              36
-  sk-ant-* keys               0
-  Bearer tokens              66
-  GitHub tokens               0
-  AWS access keys             0
-  KEY=value                  12
-  TOKEN=value                 0
-  SECRET=value                0
+  81.4% of your filesystem recovered from chat history
 
-  Email addresses            51 unique
-  Public IPs                112 unique
-  .env files               8022 refs
-
-  Results
-  ─────────────────────────────────────
-  target:       /home/ok/inference
-  depth:        3 levels
-  sessions:     1083
-  messages:     232122
-
-  real paths:   467
-  extracted:    1141
-  matches:      380
-
-  RECALL:       81.4%  (380 of 467 real paths recovered)
-  PRECISION:    33.3%  (380 of 1141 extracted paths valid)
-  missed:       87 paths not in histories
-  stale:        761 paths no longer on disk
+  381 of 468 real paths reconstructed
+  758 ghost paths (deleted files still in history)
+  87 paths never seen by the agent
 ```
 
 ## What it does
@@ -69,6 +47,9 @@ chmod +x /usr/local/bin/claude-leak-audit
 ```bash
 # Full scan — auto-detects all .claude projects, scans secrets, compares tree
 claude-leak-audit
+
+# Verbose — show secret breakdown, project roots, progress
+claude-leak-audit -v
 
 # Target a specific project
 claude-leak-audit --claude-dir ~/.claude/projects/-home-ok-myproject
