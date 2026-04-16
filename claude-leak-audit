@@ -85,6 +85,23 @@ fi
 TOTAL_LINES=$(cat $(cat "$JSONL_LIST") 2>/dev/null | wc -l)
 
 echo ""
+spin() {
+    local msg="$1"; shift
+    local chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    printf "  %s %s" "${chars:0:1}" "$msg" >&2
+    "$@" &
+    local pid=$!
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  %s %s" "${chars:i%10:1}" "$msg" >&2
+        i=$((i + 1))
+        sleep 0.1
+    done
+    wait "$pid" 2>/dev/null
+    printf "\r  ✓ %s\n" "$msg" >&2
+}
+
+echo ""
 echo "  claude-leak-audit"
 echo "  ═══════════════════════════════════════"
 echo "  scanned $NUM_FILES sessions, $TOTAL_LINES messages"
@@ -98,10 +115,9 @@ trap 'rm -f "$EXTRACTED" "${EXTRACTED}.real" "${EXTRACTED}.deduped" "${EXTRACTED
 
 FILES=$(cat "$JSONL_LIST")
 
-log "[*] Extracting paths (10 parallel jt queries)..."
-
-{
-  jt $FILES 'where .message.content[0].name in ("Read", "Edit", "Write") select .message.content[0].input.file_path as p' --raw 2>/dev/null &
+extract_paths() {
+  {
+    jt $FILES 'where .message.content[0].name in ("Read", "Edit", "Write") select .message.content[0].input.file_path as p' --raw 2>/dev/null &
   jt $FILES 'where .message.content[0].name in ("Glob", "Grep") select .message.content[0].input.path as p' --raw 2>/dev/null &
   jt $FILES 'where .message.content[0].name == "Bash" select .message.content[0].input.command as cmd' --raw 2>/dev/null &
   jt $FILES 'where .message.content[0].type == "tool_result" select to_string(.message.content[0].content) as text' --raw 2>/dev/null &
@@ -112,25 +128,27 @@ log "[*] Extracting paths (10 parallel jt queries)..."
   jt $FILES 'where .data.message.toolUseResult exists select to_string(.data.message.toolUseResult) as text' --raw 2>/dev/null &
   jt $FILES 'where .data.message.message.content exists select to_string(.data.message.message.content) as text' --raw 2>/dev/null &
   wait
-} | grep -oE '(/[a-zA-Z0-9_.~@+-]+){2,}' | sort -u > "$EXTRACTED"
+  } | grep -oE '(/[a-zA-Z0-9_.~@+-]+){2,}' | sort -u > "$EXTRACTED"
 
-grep -v -E '^/(usr|bin|sbin|lib|lib64|etc|proc|sys|dev|tmp|var/(run|lib|cache|log)|snap|nix|opt|run)' "$EXTRACTED" | \
-    grep -v -E '\.(so|dylib|o|pyc|whl|egg)$' | \
-    grep -v -E '^/[a-z]+$' | \
-    sed 's|/\+$||' | \
-    sort -u > "${EXTRACTED}.deduped"
+  grep -v -E '^/(usr|bin|sbin|lib|lib64|etc|proc|sys|dev|tmp|var/(run|lib|cache|log)|snap|nix|opt|run)' "$EXTRACTED" | \
+      grep -v -E '\.(so|dylib|o|pyc|whl|egg)$' | \
+      grep -v -E '^/[a-z]+$' | \
+      sed 's|/\+$||' | \
+      sort -u > "${EXTRACTED}.deduped"
+}
+
+spin "extracting paths from tool calls, results, messages" extract_paths
 
 NUM_PATHS=$(wc -l < "${EXTRACTED}.deduped")
-log "[*] Unique paths extracted: $NUM_PATHS"
+log "[*] $NUM_PATHS unique paths"
 
 # --- Phase 3: Secrets scan ---
 
 if $SCAN_SECRETS; then
-    log "[*] Scanning for secrets and PII..."
-
     STMP=$(mktemp -d)
     pcount() { cat "$JSONL_LIST" | xargs -P "$NCPU" -n 50 grep -ohE "$1" 2>/dev/null | wc -l | tr -d ' \n' > "$STMP/$2"; }
 
+    scan_secrets() {
     pcount 'sk-[a-zA-Z0-9_-]{20,}' sk_live &
     pcount 'sk-ant-[a-zA-Z0-9_-]{20,}' sk_ant &
     pcount 'Bearer [a-zA-Z0-9_.-]{20,}' bearer &
@@ -145,6 +163,9 @@ if $SCAN_SECRETS; then
     (cat "$JSONL_LIST" | xargs -P "$NCPU" -n 50 grep -ohE '\b[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\b' 2>/dev/null | \
         grep -v -E '^(127\.|0\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|255\.|224\.)' | sort -u | wc -l | tr -d ' \n' > "$STMP/ips") &
     wait
+    }
+
+    spin "scanning for secrets and PII" scan_secrets
 
     SK_LIVE=$(cat "$STMP/sk_live"); SK_ANT=$(cat "$STMP/sk_ant")
     BEARER=$(cat "$STMP/bearer"); GHTOKEN=$(cat "$STMP/ghtoken")
